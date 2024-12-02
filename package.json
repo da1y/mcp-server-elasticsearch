@@ -17,6 +17,7 @@
     "inspector": "npx @modelcontextprotocol/inspector build/index.js"
   },
   "dependencies": {
+    "@elastic/elasticsearch": "^8.16.2",
     "@modelcontextprotocol/sdk": "0.6.0"
   },
   "devDependencies": {

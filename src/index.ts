@@ -1,222 +1,260 @@
 #!/usr/bin/env node
-
-/**
- * This is a template MCP server that implements a simple notes system.
- * It demonstrates core MCP concepts like resources and tools by allowing:
- * - Listing notes as resources
- * - Reading individual notes
- * - Creating new notes via a tool
- * - Summarizing all notes via a prompt
- */
-
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import {
-  CallToolRequestSchema,
-  ListResourcesRequestSchema,
-  ListToolsRequestSchema,
+import { 
+  CallToolRequestSchema, 
+  ListResourcesRequestSchema, 
+  ListToolsRequestSchema, 
   ReadResourceRequestSchema,
-  ListPromptsRequestSchema,
-  GetPromptRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import { Client } from '@elastic/elasticsearch';
 
-/**
- * Type alias for a note object.
- */
-type Note = { title: string, content: string };
+interface IndexInfo {
+  index: string;
+  [key: string]: unknown;
+}
 
-/**
- * Simple in-memory storage for notes.
- * In a real implementation, this would likely be backed by a database.
- */
-const notes: { [id: string]: Note } = {
-  "1": { title: "First Note", content: "This is note 1" },
-  "2": { title: "Second Note", content: "This is note 2" }
-};
-
-/**
- * Create an MCP server with capabilities for resources (to list/read notes),
- * tools (to create new notes), and prompts (to summarize notes).
- */
 const server = new Server(
   {
-    name: "mpc-server-elasticsearch",
+    name: "example-servers/elasticsearch",
     version: "0.1.0",
   },
   {
     capabilities: {
       resources: {},
       tools: {},
-      prompts: {},
     },
   }
 );
 
-/**
- * Handler for listing available notes as resources.
- * Each note is exposed as a resource with:
- * - A note:// URI scheme
- * - Plain text MIME type
- * - Human readable name and description (now including the note title)
- */
-server.setRequestHandler(ListResourcesRequestSchema, async () => {
-  return {
-    resources: Object.entries(notes).map(([id, note]) => ({
-      uri: `note:///${id}`,
-      mimeType: "text/plain",
-      name: note.title,
-      description: `A text note: ${note.title}`
-    }))
-  };
+const args = process.argv.slice(2);
+if (args.length === 0) {
+  console.error("Please provide an Elasticsearch URL as a command-line argument");
+  process.exit(1);
+}
+
+const esUrl = args[0];
+const resourceBaseUrl = new URL(esUrl);
+resourceBaseUrl.protocol = "elasticsearch:";
+resourceBaseUrl.password = "";
+
+const client = new Client({
+  node: esUrl,
 });
 
-/**
- * Handler for reading the contents of a specific note.
- * Takes a note:// URI and returns the note content as plain text.
- */
-server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
-  const url = new URL(request.params.uri);
-  const id = url.pathname.replace(/^\//, '');
-  const note = notes[id];
+const SCHEMA_PATH = "schema";
 
-  if (!note) {
-    throw new Error(`Note ${id} not found`);
+server.setRequestHandler(ListResourcesRequestSchema, async () => {
+  try {
+    const indices = await client.cat.indices({ format: 'json' }) as IndexInfo[];
+    const resources = indices.map(index => ({
+      uri: new URL(`${index.index}/${SCHEMA_PATH}`, resourceBaseUrl).href,
+      mimeType: "application/json",
+      name: `"${index.index}" index schema`,
+    }));
+    return { resources };
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    throw new Error(`Failed to list indices: ${errorMessage}`);
+  }
+});
+
+server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+  const resourceUrl = new URL(request.params.uri);
+  const pathComponents = resourceUrl.pathname.split("/");
+  const schema = pathComponents.pop();
+  const indexName = pathComponents.pop();
+
+  if (!indexName || schema !== SCHEMA_PATH) {
+    throw new Error("Invalid resource URI");
   }
 
-  return {
-    contents: [{
-      uri: request.params.uri,
-      mimeType: "text/plain",
-      text: note.content
-    }]
-  };
+  try {
+    const response = await client.indices.getMapping({
+      index: indexName,
+    });
+    
+    const mappingData = (response as Record<string, any>)[indexName];
+    
+    return {
+      contents: [{
+        uri: request.params.uri,
+        mimeType: "application/json",
+        text: JSON.stringify(mappingData, null, 2),
+      }],
+    };
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    throw new Error(`Failed to get mapping: ${errorMessage}`);
+  }
 });
 
-/**
- * Handler that lists available tools.
- * Exposes a single "create_note" tool that lets clients create new notes.
- */
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
       {
-        name: "create_note",
-        description: "Create a new note",
+        name: "search",
+        description: "Run an Elasticsearch query",
         inputSchema: {
           type: "object",
           properties: {
-            title: {
-              type: "string",
-              description: "Title of the note"
+            index: { type: "string" },
+            query: { type: "object" },
+          },
+          required: ["index", "query"],
+        },
+      },
+      {
+        name: "create_index",
+        description: "Create a new Elasticsearch index",
+        inputSchema: {
+          type: "object",
+          properties: {
+            index: { type: "string" },
+            mappings: { 
+              type: "object",
+              description: "Index mappings configuration",
+              default: {}
             },
-            content: {
-              type: "string",
-              description: "Text content of the note"
+            settings: {
+              type: "object",
+              description: "Index settings configuration",
+              default: {}
             }
           },
-          required: ["title", "content"]
-        }
+          required: ["index"],
+        },
+      },
+      {
+        name: "list_indices",
+        description: "List all Elasticsearch indices",
+        inputSchema: {
+          type: "object",
+          properties: {},
+          required: [],
+        },
+      },
+      {
+        name: "index_document",
+        description: "Index a document in Elasticsearch",
+        inputSchema: {
+          type: "object",
+          properties: {
+            index: { type: "string" },
+            id: { 
+              type: "string",
+              description: "Optional document ID. If not provided, Elasticsearch will generate one"
+            },
+            document: { 
+              type: "object",
+              description: "Document to index"
+            },
+          },
+          required: ["index", "document"],
+        },
       }
-    ]
+    ],
   };
 });
 
-/**
- * Handler for the create_note tool.
- * Creates a new note with the provided title and content, and returns success message.
- */
+type SearchArguments = {
+  index: string;
+  query: Record<string, unknown>;
+}
+
+type CreateIndexArguments = {
+  index: string;
+  mappings?: Record<string, unknown>;
+  settings?: Record<string, unknown>;
+}
+
+type IndexDocumentArguments = {
+  index: string;
+  id?: string;
+  document: Record<string, unknown>;
+}
+
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  const args = request.params.arguments as unknown;
+  
   switch (request.params.name) {
-    case "create_note": {
-      const title = String(request.params.arguments?.title);
-      const content = String(request.params.arguments?.content);
-      if (!title || !content) {
-        throw new Error("Title and content are required");
+    case "search": {
+      const { index, query } = args as SearchArguments;
+      try {
+        const result = await client.search({
+          index,
+          body: query,
+        });
+        return {
+          content: [{ type: "text", text: JSON.stringify(result.hits, null, 2) }],
+          isError: false,
+        };
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+        throw new Error(`Search failed: ${errorMessage}`);
       }
+    }
 
-      const id = String(Object.keys(notes).length + 1);
-      notes[id] = { title, content };
+    case "create_index": {
+      const { index, mappings = {}, settings = {} } = args as CreateIndexArguments;
+      try {
+        const result = await client.indices.create({
+          index,
+          body: {
+            mappings,
+            settings
+          }
+        });
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+          isError: false,
+        };
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+        throw new Error(`Failed to create index: ${errorMessage}`);
+      }
+    }
 
-      return {
-        content: [{
-          type: "text",
-          text: `Created note ${id}: ${title}`
-        }]
-      };
+    case "list_indices": {
+      try {
+        const indices = await client.cat.indices({ format: 'json' });
+        return {
+          content: [{ type: "text", text: JSON.stringify(indices, null, 2) }],
+          isError: false,
+        };
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+        throw new Error(`Failed to list indices: ${errorMessage}`);
+      }
+    }
+
+    case "index_document": {
+      const { index, id, document } = args as IndexDocumentArguments;
+      try {
+        const result = await client.index({
+          index,
+          id,
+          document,
+          refresh: true  // Make document immediately available for search
+        });
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+          isError: false,
+        };
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+        throw new Error(`Failed to index document: ${errorMessage}`);
+      }
     }
 
     default:
-      throw new Error("Unknown tool");
+      throw new Error(`Unknown tool: ${request.params.name}`);
   }
 });
 
-/**
- * Handler that lists available prompts.
- * Exposes a single "summarize_notes" prompt that summarizes all notes.
- */
-server.setRequestHandler(ListPromptsRequestSchema, async () => {
-  return {
-    prompts: [
-      {
-        name: "summarize_notes",
-        description: "Summarize all notes",
-      }
-    ]
-  };
-});
-
-/**
- * Handler for the summarize_notes prompt.
- * Returns a prompt that requests summarization of all notes, with the notes' contents embedded as resources.
- */
-server.setRequestHandler(GetPromptRequestSchema, async (request) => {
-  if (request.params.name !== "summarize_notes") {
-    throw new Error("Unknown prompt");
-  }
-
-  const embeddedNotes = Object.entries(notes).map(([id, note]) => ({
-    type: "resource" as const,
-    resource: {
-      uri: `note:///${id}`,
-      mimeType: "text/plain",
-      text: note.content
-    }
-  }));
-
-  return {
-    messages: [
-      {
-        role: "user",
-        content: {
-          type: "text",
-          text: "Please summarize the following notes:"
-        }
-      },
-      ...embeddedNotes.map(note => ({
-        role: "user" as const,
-        content: note
-      })),
-      {
-        role: "user",
-        content: {
-          type: "text",
-          text: "Provide a concise summary of all the notes above."
-        }
-      }
-    ]
-  };
-});
-
-/**
- * Start the server using stdio transport.
- * This allows the server to communicate via standard input/output streams.
- */
-async function main() {
+async function runServer() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }
 
-main().catch((error) => {
-  console.error("Server error:", error);
-  process.exit(1);
-});
+runServer().catch(console.error);
