@@ -1,6 +1,8 @@
 # Elasticsearch
 A Model Context Protocol server for Elasticsearch clusters. Enables LLMs to manage indices and execute queries.
 
+IMPORRANT NOTE : this was built mainly by feeding examples to claude from the postgres mcp server.
+
 ## Components
 
 ### Tools
